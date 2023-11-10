@@ -1,10 +1,10 @@
+import random
 import argparse
 import copy
 import itertools
 import logging
 import math
 import os
-import random
 import shutil
 from pathlib import Path
 
@@ -12,17 +12,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-import torchvision.transforms.v2 as transforms_v2
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
+import torchvision.transforms.v2 as transforms_v2
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, CLIPTextModel
 
@@ -30,23 +29,20 @@ import diffusers
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    DPMSolverMultistepScheduler,
     StableDiffusionInpaintPipeline,
+    DPMSolverMultistepScheduler,
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
-
-if is_wandb_available():
-    import wandb
+from peft import PeftModel, LoraConfig, get_peft_model
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.20.1")
 
 logger = get_logger(__name__)
-
 
 def make_mask(images, resolution, times=30):
     mask, times = torch.ones_like(images[0:1, :, :]), np.random.randint(1, times)
@@ -59,11 +55,10 @@ def make_mask(images, resolution, times=30):
 
         x_start = np.random.randint(int(margin), resolution - int(margin) - width + 1)
         y_start = np.random.randint(int(margin), resolution - int(margin) - height + 1)
-        mask[:, y_start : y_start + height, x_start : x_start + width] = 0
+        mask[:, y_start:y_start + height, x_start:x_start + width] = 0
 
     mask = 1 - mask if random.random() < 0.5 else mask
     return mask
-
 
 def save_model_card(
     repo_id: str,
@@ -100,7 +95,6 @@ You can find some example images in the following. \n
     with open(os.path.join(repo_folder, "README.md"), "w") as f:
         f.write(yaml + model_card)
 
-
 def log_validation(
     text_encoder,
     tokenizer,
@@ -110,14 +104,15 @@ def log_validation(
     weight_dtype,
     epoch,
 ):
-    logger.info(f"Running validation... \nGenerating {args.num_validation_images} images")
+    logger.info(
+        f"Running validation... \nGenerating {args.num_validation_images} images"
+    )
 
     # create pipeline (note: unet and vae are loaded again in float32)
     pipeline = StableDiffusionInpaintPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         tokenizer=tokenizer,
         revision=args.revision,
-        torch_dtype=weight_dtype,
     )
 
     # set `keep_fp32_wrapper` to True because we do not want to remove
@@ -142,27 +137,28 @@ def log_validation(
     images = []
     for _ in range(args.num_validation_images):
         image = pipeline(
-            prompt="a photo of sks",
-            image=image,
-            mask_image=mask_image,
-            num_inference_steps=25,
-            guidance_scale=5,
-            generator=generator,
+            prompt="a photo of sks", image=image, mask_image=mask_image,
+            num_inference_steps=25, guidance_scale=5, generator=generator
         ).images[0]
         images.append(image)
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+            tracker.writer.add_images(f"validation", np_images, epoch, dataformats="NHWC")
         if tracker.name == "wandb":
-            tracker.log({"validation": [wandb.Image(image, caption=str(i)) for i, image in enumerate(images)]})
+            tracker.log(
+                {
+                    f"validation": [
+                        wandb.Image(image, caption=str(i)) for i, image in enumerate(images)
+                    ]
+                }
+            )
 
     del pipeline
     torch.cuda.empty_cache()
 
     return images
-
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -421,7 +417,6 @@ def parse_args(input_args=None):
 
     return args
 
-
 class RealFillDataset(Dataset):
     """
     A dataset to prepare the training and conditioning images and
@@ -497,7 +492,6 @@ class RealFillDataset(Dataset):
 
         return example
 
-
 def collate_fn(examples):
     input_ids = [example["prompt_ids"] for example in examples]
     images = [example["images"] for example in examples]
@@ -529,7 +523,6 @@ def collate_fn(examples):
     }
     return batch
 
-
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -543,6 +536,7 @@ def main(args):
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+        import wandb
 
         wandb.login(key=args.wandb_key)
         wandb.init(project=args.wandb_project_name)
@@ -599,7 +593,7 @@ def main(args):
     config = LoraConfig(
         r=args.lora_rank,
         lora_alpha=args.lora_alpha,
-        target_modules=["to_k", "to_q", "to_v", "key", "query", "value"],
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
         lora_dropout=args.lora_dropout,
         bias=args.lora_bias,
     )
@@ -637,11 +631,7 @@ def main(args):
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             for model in models:
-                sub_dir = (
-                    "unet"
-                    if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet.base_model.model)))
-                    else "text_encoder"
-                )
+                sub_dir = "unet" if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet).base_model.model)) else "text_encoder"
                 model.save_pretrained(os.path.join(output_dir, sub_dir))
 
                 # make sure to pop weight so that corresponding model is not saved again
@@ -652,16 +642,8 @@ def main(args):
             # pop models so that they are not loaded again
             model = models.pop()
 
-            sub_dir = (
-                "unet"
-                if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet.base_model.model)))
-                else "text_encoder"
-            )
-            model_cls = (
-                UNet2DConditionModel
-                if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet.base_model.model)))
-                else CLIPTextModel
-            )
+            sub_dir = "unet" if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet).base_model.model)) else "text_encoder"
+            model_cls = UNet2DConditionModel if isinstance(model.base_model.model, type(accelerator.unwrap_model(unet).base_model.model)) else CLIPTextModel
 
             load_model = model_cls.from_pretrained(args.pretrained_model_name_or_path, subfolder=sub_dir)
             load_model = PeftModel.from_pretrained(load_model, input_dir, subfolder=sub_dir)
@@ -679,17 +661,11 @@ def main(args):
 
     if args.scale_lr:
         args.unet_learning_rate = (
-            args.unet_learning_rate
-            * args.gradient_accumulation_steps
-            * args.train_batch_size
-            * accelerator.num_processes
+            args.unet_learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
         args.text_encoder_learning_rate = (
-            args.text_encoder_learning_rate
-            * args.gradient_accumulation_steps
-            * args.train_batch_size
-            * accelerator.num_processes
+            args.text_encoder_learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -709,7 +685,7 @@ def main(args):
     optimizer = optimizer_class(
         [
             {"params": unet.parameters(), "lr": args.unet_learning_rate},
-            {"params": text_encoder.parameters(), "lr": args.text_encoder_learning_rate},
+            {"params": text_encoder.parameters(), "lr": args.text_encoder_learning_rate}
         ],
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -851,7 +827,9 @@ def main(args):
                 bsz = latents.shape[0]
 
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device
+                )
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -874,7 +852,9 @@ def main(args):
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = itertools.chain(unet.parameters(), text_encoder.parameters())
+                    params_to_clip = itertools.chain(
+                        unet.parameters(), text_encoder.parameters()
+                    )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
@@ -937,8 +917,8 @@ def main(args):
     if accelerator.is_main_process:
         pipeline = StableDiffusionInpaintPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
-            unet=accelerator.unwrap_model(unet.merge_and_unload(), keep_fp32_wrapper=True),
-            text_encoder=accelerator.unwrap_model(text_encoder.merge_and_unload(), keep_fp32_wrapper=True),
+            unet=accelerator.unwrap_model(une, keep_fp32_wrapper=True)t.merge_and_unload(),
+            text_encoder=accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True).merge_and_unload(),
             revision=args.revision,
         )
 
@@ -970,7 +950,6 @@ def main(args):
             )
 
     accelerator.end_training()
-
 
 if __name__ == "__main__":
     args = parse_args()
